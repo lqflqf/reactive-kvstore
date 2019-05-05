@@ -1,6 +1,6 @@
 package kvstore
 
-import akka.actor.{Actor, ActorRef, OneForOneStrategy, Props}
+import akka.actor.{Actor, ActorRef, Cancellable, OneForOneStrategy, PoisonPill, Props, SupervisorStrategy, Terminated}
 import kvstore.Arbiter._
 
 import scala.collection.immutable.Queue
@@ -8,32 +8,39 @@ import akka.actor.SupervisorStrategy.Restart
 
 import scala.annotation.tailrec
 import akka.pattern.{AskTimeoutException, ask, pipe}
-import akka.actor.Terminated
 
 import scala.concurrent.duration._
-import akka.actor.PoisonPill
-import akka.actor.OneForOneStrategy
-import akka.actor.SupervisorStrategy
 import akka.util.Timeout
 
+import scala.concurrent.{Await, Future}
+
 object Replica {
+
   sealed trait Operation {
     def key: String
+
     def id: Long
   }
+
   case class Insert(key: String, value: String, id: Long) extends Operation
+
   case class Remove(key: String, id: Long) extends Operation
+
   case class Get(key: String, id: Long) extends Operation
 
   sealed trait OperationReply
+
   case class OperationAck(id: Long) extends OperationReply
+
   case class OperationFailed(id: Long) extends OperationReply
+
   case class GetResult(key: String, valueOption: Option[String], id: Long) extends OperationReply
 
   def props(arbiter: ActorRef, persistenceProps: Props): Props = Props(new Replica(arbiter, persistenceProps))
 }
 
 class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
+
   import Replica._
   import Replicator._
   import Persistence._
@@ -43,7 +50,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   /*
    * The contents of this actor is just a suggestion, you can implement it in any way you like.
    */
-  
+
   var kv = Map.empty[String, String]
   // a map from secondary replicas to replicators
   var secondaries = Map.empty[ActorRef, ActorRef]
@@ -56,14 +63,27 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   //Persistence actor
   val persistence = context.system.actorOf(persistenceProps)
 
+  //replicator map
+  var repMap = Map.empty[Long, Set[ActorRef]]
+
+  //cancel map
+  var cancelMmap = Map.empty[Long, Cancellable]
+
+  //reply map
+  var senderMap = Map.empty[Long, ActorRef]
+
+
   arbiter ! Join
 
-  override val supervisorStrategy = OneForOneStrategy(){
+  override val supervisorStrategy = OneForOneStrategy() {
     case _: PersistenceException => Restart
   }
 
+  implicit val timeout = Timeout(1 second)
+
+
   def receive = {
-    case JoinedPrimary   => context.become(leader)
+    case JoinedPrimary => context.become(leader)
     case JoinedSecondary => context.become(replica)
   }
 
@@ -72,19 +92,19 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
 
     case Replicas(replicas) =>
-      for (d <- secondaries.keySet.diff(replicas)) {
+      for (d <- replicas.-(self).diff(secondaries.keySet)) {
         val rep = context.system.actorOf(Replicator.props(d))
-        secondaries += d->rep
+        secondaries += d -> rep
         replicators += rep
       }
 
     case i: Insert =>
-      self.ask(Replicate(i.key, Some(i.value), i.id))(1 second).recover{
+      (self ? Replicate(i.key, Some(i.value), i.id)).recover {
         case _: AskTimeoutException => OperationFailed(i.id)
       }.pipeTo(sender())
 
     case r: Remove =>
-     self.ask(Replicate(r.key, None, r.id))(1 second).recover{
+      (self ? Replicate(r.key, None, r.id)).recover {
         case _: AskTimeoutException => OperationFailed(r.id)
       }.pipeTo(sender())
 
@@ -92,16 +112,47 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
     case r: Replicate =>
       r.valueOption match {
-        case Some(x) => kv += r.key->x
+        case Some(x) => kv += r.key -> x
         case None => kv -= r.key
       }
-      replicators.foreach(_ ! r)
 
-      persistence ! Persist(r.key, r.valueOption, r.id)
 
-      sender() ! OperationAck(r.id)
+      senderMap += r.id -> sender()
 
-    case _ =>
+      if (!replicators.isEmpty) {
+        replicators.foreach(_ ! r)
+        repMap += r.id -> replicators
+      }
+
+      val c =
+        context.system.scheduler.schedule(0 millisecond, 100 milliseconds, persistence, Persist(r.key, r.valueOption, r.id))
+
+      cancelMmap += r.id -> c
+
+    case p: Persisted =>
+      val c = cancelMmap(p.id)
+      cancelMmap -= p.id
+      c.cancel()
+      if (repMap.get(p.id).isEmpty) {
+        val s = senderMap(p.id)
+        senderMap -= p.id
+        s ! OperationAck(p.id)
+      }
+
+    case re: Replicated =>
+      var rep_set = repMap(re.id)
+      rep_set -= sender()
+      if (rep_set.isEmpty) {
+        repMap -= re.id
+        if (cancelMmap.get(re.id).isEmpty) {
+          val s = senderMap(re.id)
+          senderMap -= re.id
+          s ! OperationAck(re.id)
+        }
+
+      } else {
+        repMap += re.id -> rep_set
+      }
 
   }
 
@@ -109,21 +160,33 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
   val replica: Receive = {
     case g: Get => sender() ! GetResult(g.key, kv.get(g.key), g.id)
     case s: Snapshot =>
-      if (s.seq == _seqExpected){
+      if (s.seq == _seqExpected) {
         s.valueOption match {
-          case Some(x) => kv += s.key->x
+          case Some(x) => kv += s.key -> x
           case None => kv -= s.key
         }
         _seqExpected += 1
 
-        persistence ! Persist(s.key, s.valueOption, s.seq)
+        senderMap += s.seq -> sender()
 
-        sender() ! SnapshotAck(s.key, s.seq)
+        val c =
+          context.system.scheduler.schedule(0 millisecond, 100 milliseconds, persistence, Persist(s.key, s.valueOption, s.seq))
+
+        cancelMmap += s.seq -> c
       }
       else if (s.seq < _seqExpected) {
         sender() ! SnapshotAck(s.key, s.seq)
       }
+    case p: Persisted =>
+      val c = cancelMmap(p.id)
+      cancelMmap -= p.id
+      c.cancel()
+      val s = senderMap(p.id)
+      senderMap -= p.id
+      s ! SnapshotAck(p.key, p.id)
+
   }
+
 
 }
 
