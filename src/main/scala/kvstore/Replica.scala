@@ -92,11 +92,43 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
 
 
     case Replicas(replicas) =>
+
+      // add replica
       for (d <- replicas.-(self).diff(secondaries.keySet)) {
         val rep = context.system.actorOf(Replicator.props(d))
         secondaries += d -> rep
         replicators += rep
+
+        for ((k, v) <- kv) rep ! Replicate(k, Some(v), 0L)
+
       }
+
+      // remove replica
+      for (d <- secondaries.keySet.diff(replicas.-(self))) {
+        val rep = secondaries(d)
+        rep ! PoisonPill
+        secondaries -= d
+        replicators -= rep
+
+        repMap.foreach {
+          i =>
+            if (i._2.contains(rep)) {
+              val v2 = i._2.-(rep)
+              if (v2.isEmpty) {
+                repMap -= i._1
+                if (cancelMmap.get(i._1).isEmpty) {
+                  val s = senderMap(i._1)
+                  senderMap -= i._1
+                  s ! OperationAck(i._1)
+                }
+              }
+              else {
+                repMap += i._1 -> v2
+              }
+            }
+        }
+      }
+
 
     case i: Insert =>
       (self ? Replicate(i.key, Some(i.value), i.id)).recover {
@@ -115,8 +147,7 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
         case Some(x) => kv += r.key -> x
         case None => kv -= r.key
       }
-
-
+      
       senderMap += r.id -> sender()
 
       if (!replicators.isEmpty) {
@@ -140,20 +171,21 @@ class Replica(val arbiter: ActorRef, persistenceProps: Props) extends Actor {
       }
 
     case re: Replicated =>
-      var rep_set = repMap(re.id)
-      rep_set -= sender()
-      if (rep_set.isEmpty) {
-        repMap -= re.id
-        if (cancelMmap.get(re.id).isEmpty) {
-          val s = senderMap(re.id)
-          senderMap -= re.id
-          s ! OperationAck(re.id)
+      if (repMap.contains(re.id)) {
+        var rep_set = repMap(re.id)
+        rep_set -= sender()
+        if (rep_set.isEmpty) {
+          repMap -= re.id
+          if (cancelMmap.get(re.id).isEmpty) {
+            val s = senderMap(re.id)
+            senderMap -= re.id
+            s ! OperationAck(re.id)
+          }
+
+        } else {
+          repMap += re.id -> rep_set
         }
-
-      } else {
-        repMap += re.id -> rep_set
       }
-
   }
 
   /* TODO Behavior for the replica role. */
